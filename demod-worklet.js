@@ -1,4 +1,4 @@
-// AudioWorkletProcessor: BPSK demod with Costas PLL, matched filter, and simple Gardner timing loop.
+// AudioWorkletProcessor: BPSK demod with Costas PLL, AGC, matched filter, fixed-rate sampler.
 // Emits hard bits only after preamble correlation; sync/FEC parsing is done on the main thread.
 
 class BpskDemodProcessor extends AudioWorkletProcessor {
@@ -8,8 +8,8 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
     this.fc = 18_000;
     this.symbolRate = 500;
     this.preambleSymbols = 80;
-    this.lockThreshold = 0.35; // normalized corr for 1010... window
-    this.holdoffSymbols = 8;  // skip symbols after lock to let PLL settle
+    this.lockThreshold = 0.6; // normalized corr for 1010... window
+    this.holdoffSymbols = 6;  // skip symbols after lock to let PLL settle
 
     this.resetState();
     this.buildFilters();
@@ -37,16 +37,15 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
 
   buildFilters() {
     this.spsFloat = sampleRate / this.symbolRate;
-    this.spsNom = this.spsFloat;
-    this.omega = this.spsFloat;
+    this.timeStep = this.spsFloat;
     this.ncoStep = (2 * Math.PI * this.fc) / sampleRate;
 
     // Low-pass for I/Q after mixing. Cutoff ~ 2x symbol rate, min 300 Hz.
     const cutoff = Math.max(300, this.symbolRate * 2.2);
     this.lpfAlpha = this.calcAlpha(cutoff);
 
-    // Raised-cosine-ish matched filter (~6 symbols long).
-    const tapsLen = Math.max(16, Math.round(this.spsFloat * 6));
+    // Raised-cosine-ish matched filter (~4 symbols long).
+    const tapsLen = Math.max(12, Math.round(this.spsFloat * 4));
     this.mfTaps = new Float32Array(tapsLen);
     for (let i = 0; i < tapsLen; i++) {
       this.mfTaps[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (tapsLen - 1));
@@ -70,15 +69,11 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
     this.agcAlpha = this.calcAlpha(20); // slow envelope tracker
     this.pllAlpha = 2e-4;
     this.pllBeta = 5e-7;
-    this.clockAlpha = 1e-3;
-    this.clockBeta = 5e-4;
     this.timeAcc = 0;
-    this.prevSym = 0;
     this.outBits = [];
     this.signBuf = [];
     this.locked = false;
     this.holdoff = 0;
-    this.preambleCorr = 0;
     this.mfPos = 0;
     this.processedSamples = 0;
     this.delayReport = 0;
@@ -133,22 +128,11 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
       if (this.mfPos >= tapsLen) this.mfPos = 0;
       const y = this.applyMatchedFilter();
 
-      // 6) Timing recovery (Gardner-ish)
+      // 6) Fixed-rate sampling
       this.timeAcc += 1;
-      while (this.timeAcc >= this.omega) {
-        this.timeAcc -= this.omega;
-        const midIdx = (this.mfPos - Math.round(this.omega / 2) + tapsLen) % tapsLen;
-        const mid = this.mfBuf[midIdx];
-        const sym = y;
-        const terr = (sym - this.prevSym) * mid;
-        this.omega += this.clockBeta * terr;
-        const omegaMin = this.spsNom * 0.8;
-        const omegaMax = this.spsNom * 1.2;
-        if (this.omega < omegaMin) this.omega = omegaMin;
-        else if (this.omega > omegaMax) this.omega = omegaMax;
-        this.timeAcc += this.clockAlpha * terr;
-        this.handleSymbol(sym);
-        this.prevSym = sym;
+      while (this.timeAcc >= this.timeStep) {
+        this.timeAcc -= this.timeStep;
+        this.handleSymbol(y);
       }
       this.processedSamples += 1;
     }
@@ -190,15 +174,17 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
     }
     if (!this.locked && this.signBuf.length === this.preambleSymbols) {
       let corr = 0;
+      let energy = 0;
       for (let i = 0; i < this.preambleSymbols; i++) {
         corr += this.signBuf[i] * this.altSeq[i];
+        energy += Math.abs(this.signBuf[i]);
       }
-      corr /= this.preambleSymbols;
-      if (corr > this.lockThreshold) {
+      const normCorr = energy > 0 ? corr / energy : 0;
+      if (normCorr > this.lockThreshold) {
         this.locked = true;
         this.holdoff = this.holdoffSymbols;
         this.outBits.length = 0; // drop preamble decisions
-        this.port.postMessage({ type: 'locked', score: corr });
+        this.port.postMessage({ type: 'locked', score: normCorr });
         return;
       }
     }
