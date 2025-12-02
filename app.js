@@ -4,6 +4,10 @@ const SYMBOL_RATE = 500; // baud
 const PREAMBLE_BITS = 80;
 const SYNC_WORD = 0xa5a5a5a5 >>> 0;
 const VERSION = 1;
+const K = 7;
+const FLUSH_BITS = K - 1; // tail bits for trellis termination
+const G0 = 0x5b; // 133 octal
+const G1 = 0x79; // 171 octal
 
 const textInput = document.getElementById('textInput');
 const sendBtn = document.getElementById('sendBtn');
@@ -17,12 +21,14 @@ let audioCtx;
 let demodNode;
 let listening = false;
 let bitBuffer = [];
+let codedBuffer = [];
 let synced = false;
 let stream;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 const syncBits = wordToBits(SYNC_WORD, 32);
+const transitions = buildTransitions();
 
 sendBtn.addEventListener('click', () => {
   const text = textInput.value || '';
@@ -103,9 +109,13 @@ function buildFrameBits(text) {
   const bits = [];
   bits.push(...buildPreambleBits());
   bits.push(...wordToBits(SYNC_WORD, 32));
-  bits.push(...bytesToBits(header));
-  bits.push(...bytesToBits(payload));
-  bits.push(...bytesToBits(crcBytes));
+  const infoBits = [
+    ...bytesToBits(header),
+    ...bytesToBits(payload),
+    ...bytesToBits(crcBytes),
+  ];
+  const fecBits = convEncode(infoBits);
+  bits.push(...fecBits);
   return bits;
 }
 
@@ -160,7 +170,7 @@ async function startListening() {
     listenBtn.classList.add('active');
     modePill.textContent = 'Режим: listen';
     statusPill.textContent = 'слушаем...';
-    log('Слушаем микрофон, ищем преамбулу');
+  log('Слушаем микрофон, ищем преамбулу');
   } catch (err) {
     console.error(err);
     log(`Ошибка доступа к микрофону: ${err.message}`);
@@ -203,51 +213,26 @@ function handleBits(bits) {
   if (!synced) {
     const idx = findSync(bitBuffer, syncBits);
     if (idx !== -1) {
-      bitBuffer = bitBuffer.slice(idx + syncBits.length);
+      codedBuffer = bitBuffer.slice(idx + syncBits.length);
+      bitBuffer = [];
       synced = true;
       statusPill.textContent = 'sync найден';
-      log('Синхрослово найдено, читаем кадр...');
+      log('Синхрослово найдено, FEC декод...');
+      return;
     } else if (bitBuffer.length > 4096) {
       bitBuffer = bitBuffer.slice(-2048);
     }
     return;
   }
 
-  if (bitBuffer.length < 16) return;
-  const len = bitsToByte(bitBuffer.slice(0, 8));
-  const flags = bitsToByte(bitBuffer.slice(8, 16));
-  if (len > 255) {
-    log(`Неверная длина (${len}), сбрасываем`);
-    resetAfterFrame();
-    return;
-  }
-
-  const need = 16 + len * 8 + 16;
-  if (bitBuffer.length < need) return;
-
-  const payloadBits = bitBuffer.slice(16, 16 + len * 8);
-  const crcBits = bitBuffer.slice(16 + len * 8, need);
-  const dataBytes = bitsToBytes(bitBuffer.slice(0, 16 + len * 8));
-  const recvCrc = bitsToWord(crcBits);
-  const calc = crc16(dataBytes);
-
-  if (recvCrc === calc) {
-    const payloadBytes = bitsToBytes(payloadBits);
-    const text = safeDecode(payloadBytes);
-    addRx(text);
-    statusPill.textContent = 'кадр принят';
-    log(`Кадр принят: ${text} (len=${len}, flags=${flags})`);
-  } else {
-    statusPill.textContent = 'CRC ошибка';
-    log(`CRC ошибка (ожидалось ${calc.toString(16)}, пришло ${recvCrc.toString(16)})`);
-  }
-
-  bitBuffer = bitBuffer.slice(need);
-  resetAfterFrame();
+  codedBuffer.push(...bits);
+  tryDecodeFrame();
 }
 
 function resetAfterFrame() {
   synced = false;
+  bitBuffer = [];
+  codedBuffer = [];
   if (demodNode) {
     demodNode.port.postMessage({ type: 'reset' });
   }
@@ -308,6 +293,140 @@ function bitsToWord(bits) {
     val = (val << 1) | (bits[i] & 1);
   }
   return val >>> 0;
+}
+
+function parity(v) {
+  v ^= v >> 4;
+  v ^= v >> 2;
+  v ^= v >> 1;
+  return v & 1;
+}
+
+function convEncode(infoBits) {
+  let state = 0;
+  const out = [];
+  const pushBit = (b) => {
+    state = ((state << 1) | (b & 1)) & 0x7f;
+    out.push(parity(state & G0));
+    out.push(parity(state & G1));
+  };
+  for (const b of infoBits) pushBit(b);
+  for (let i = 0; i < FLUSH_BITS; i++) pushBit(0);
+  return out;
+}
+
+function buildTransitions() {
+  const table = Array.from({ length: 64 }, () => [null, null]);
+  for (let state = 0; state < 64; state++) {
+    for (let bit = 0; bit <= 1; bit++) {
+      const reg = ((state << 1) | bit) & 0x7f;
+      const next = reg & 0x3f;
+      const o0 = parity(reg & G0);
+      const o1 = parity(reg & G1);
+      table[state][bit] = { next, o0, o1 };
+    }
+  }
+  return table;
+}
+
+function viterbiDecode(codedBits) {
+  const evenLen = codedBits.length & ~1;
+  if (evenLen < 2) return [];
+  const steps = evenLen / 2;
+  const INF = 1e9;
+  let metrics = new Float32Array(64).fill(INF);
+  metrics[0] = 0;
+  const decisions = Array(steps);
+
+  for (let i = 0; i < steps; i++) {
+    const r0 = codedBits[i * 2];
+    const r1 = codedBits[i * 2 + 1];
+    const nextMetrics = new Float32Array(64).fill(INF);
+    const dec = new Uint8Array(64);
+    for (let state = 0; state < 64; state++) {
+      const base = metrics[state];
+      if (base >= INF) continue;
+      for (let bit = 0; bit <= 1; bit++) {
+        const t = transitions[state][bit];
+        const dist = (t.o0 !== r0) + (t.o1 !== r1);
+        const cand = base + dist;
+        if (cand < nextMetrics[t.next]) {
+          nextMetrics[t.next] = cand;
+          dec[t.next] = (state << 1) | bit;
+        }
+      }
+    }
+    metrics = nextMetrics;
+    decisions[i] = dec;
+  }
+
+  let bestState = 0;
+  let bestMetric = metrics[0];
+  for (let s = 1; s < 64; s++) {
+    if (metrics[s] < bestMetric) {
+      bestMetric = metrics[s];
+      bestState = s;
+    }
+  }
+
+  const bits = new Array(steps);
+  for (let i = steps - 1; i >= 0; i--) {
+    const code = decisions[i][bestState];
+    const bit = code & 1;
+    const prev = code >> 1;
+    bits[i] = bit;
+    bestState = prev;
+  }
+  return bits;
+}
+
+function tryDecodeFrame() {
+  const minInfoBits = 16 + 16; // header + CRC without payload
+  const minCodedBits = 2 * (minInfoBits + FLUSH_BITS);
+  if (codedBuffer.length < minCodedBits) return;
+
+  const decodedSoft = viterbiDecode(codedBuffer);
+  if (!decodedSoft.length) return;
+  const infoWithTail = decodedSoft;
+  if (infoWithTail.length <= FLUSH_BITS) return;
+  const infoBits = infoWithTail.slice(0, infoWithTail.length - FLUSH_BITS);
+  if (infoBits.length < 16) return;
+
+  const len = bitsToByte(infoBits.slice(0, 8));
+  const flags = bitsToByte(infoBits.slice(8, 16));
+  if (len > 255) {
+    log(`Неверная длина (${len}), сбрасываем`);
+    resetAfterFrame();
+    return;
+  }
+
+  const neededInfo = 16 + len * 8 + 16;
+  const neededCoded = 2 * (neededInfo + FLUSH_BITS);
+  if (codedBuffer.length < neededCoded) return;
+
+  const decoded = viterbiDecode(codedBuffer.slice(0, neededCoded));
+  if (!decoded.length || decoded.length < neededInfo + FLUSH_BITS) return;
+
+  const info = decoded.slice(0, neededInfo);
+  const payloadBits = info.slice(16, 16 + len * 8);
+  const crcBits = info.slice(16 + len * 8);
+  const dataBytes = bitsToBytes(info.slice(0, 16 + len * 8));
+  const recvCrc = bitsToWord(crcBits);
+  const calc = crc16(dataBytes);
+
+  if (recvCrc === calc) {
+    const payloadBytes = bitsToBytes(payloadBits);
+    const text = safeDecode(payloadBytes);
+    addRx(text);
+    statusPill.textContent = 'кадр принят (FEC ok)';
+    log(`Кадр принят: ${text} (len=${len}, flags=${flags})`);
+  } else {
+    statusPill.textContent = 'CRC ошибка';
+    log(`CRC ошибка (ожидалось ${calc.toString(16)}, пришло ${recvCrc.toString(16)})`);
+  }
+
+  codedBuffer = [];
+  resetAfterFrame();
 }
 
 function crc16(bytes) {
