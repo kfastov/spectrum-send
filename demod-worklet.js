@@ -20,8 +20,11 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
       .map((_, i) => (i % 2 === 0 ? 1 : -1));
 
     this.port.onmessage = (ev) => {
-      if (ev.data && ev.data.type === 'reset') {
+      if (!ev.data) return;
+      if (ev.data.type === 'reset') {
         this.reset();
+      } else if (ev.data.type === 'config') {
+        this.applyConfig(ev.data);
       }
     };
   }
@@ -32,6 +35,21 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
     this.locked = false;
     this.phase = 0;
     this.lpState = 0;
+  }
+
+  applyConfig(cfg) {
+    if (typeof cfg.carrierHz === 'number') {
+      this.fc = cfg.carrierHz;
+    }
+    if (typeof cfg.symbolRate === 'number' && cfg.symbolRate > 0) {
+      this.symbolRate = cfg.symbolRate;
+    }
+    this.sps = Math.max(1, Math.round(sampleRate / this.symbolRate));
+    this.phaseInc = (2 * Math.PI * this.fc) / sampleRate;
+    this.altSeq = new Array(this.preambleSymbols)
+      .fill(0)
+      .map((_, i) => (i % 2 === 0 ? 1 : -1));
+    this.reset();
   }
 
   calcAlpha(cutoff) {

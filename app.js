@@ -1,6 +1,10 @@
 // Simple 18 kHz BPSK modem demo (send + listen) without external deps.
-const CARRIER = 18_000;
-const SYMBOL_RATE = 500; // baud
+const DEFAULT_CARRIER = 18_000;
+const DEFAULT_SYMBOL_RATE = 500; // baud
+const MIN_CARRIER = 15_000;
+const MAX_CARRIER = 21_000;
+const MIN_BAUD = 100;
+const MAX_BAUD = 1_500;
 const PREAMBLE_BITS = 80;
 const SYNC_WORD = 0xa5a5a5a5 >>> 0;
 const VERSION = 1;
@@ -16,6 +20,9 @@ const modePill = document.getElementById('modePill');
 const statusPill = document.getElementById('statusPill');
 const rxArea = document.getElementById('rxArea');
 const logArea = document.getElementById('logArea');
+const freqInput = document.getElementById('freqInput');
+const baudInput = document.getElementById('baudInput');
+const fecCheckbox = document.getElementById('fecCheckbox');
 
 let audioCtx;
 let demodNode;
@@ -24,6 +31,9 @@ let bitBuffer = [];
 let codedBuffer = [];
 let synced = false;
 let stream;
+let carrierHz = DEFAULT_CARRIER;
+let symbolRate = DEFAULT_SYMBOL_RATE;
+let useFEC = true;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -46,11 +56,42 @@ listenBtn.addEventListener('click', () => {
   listening ? stopListening() : startListening();
 });
 
+freqInput.addEventListener('change', applySettingsFromUI);
+baudInput.addEventListener('change', applySettingsFromUI);
+fecCheckbox.addEventListener('change', applySettingsFromUI);
+
+applySettingsFromUI();
+
 function log(msg) {
   const line = document.createElement('div');
   line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
   logArea.appendChild(line);
   logArea.scrollTop = logArea.scrollHeight;
+}
+
+function clamp(v, lo, hi) {
+  return Math.min(Math.max(v, lo), hi);
+}
+
+function applySettingsFromUI() {
+  carrierHz = clamp(parseInt(freqInput.value, 10) || DEFAULT_CARRIER, MIN_CARRIER, MAX_CARRIER);
+  freqInput.value = carrierHz;
+  symbolRate = clamp(parseInt(baudInput.value, 10) || DEFAULT_SYMBOL_RATE, MIN_BAUD, MAX_BAUD);
+  baudInput.value = symbolRate;
+  useFEC = !!fecCheckbox.checked;
+  updatePills();
+  if (demodNode) {
+    demodNode.port.postMessage({ type: 'config', carrierHz, symbolRate });
+    bitBuffer = [];
+    codedBuffer = [];
+    synced = false;
+    statusPill.textContent = 'слушаем...';
+  }
+}
+
+function updatePills() {
+  document.getElementById('carrierPill').textContent = `fc: ${(carrierHz / 1000).toFixed(1)} кГц`;
+  document.getElementById('ratePill').textContent = `${symbolRate} бод`;
 }
 
 function addRx(text) {
@@ -78,12 +119,13 @@ async function ensureContext() {
 }
 
 async function playFrame(text) {
+  applySettingsFromUI();
   const ctx = await ensureContext();
   const sampleRate = ctx.sampleRate;
-  const sps = Math.round(sampleRate / SYMBOL_RATE);
+  const sps = Math.max(1, Math.round(sampleRate / symbolRate));
 
-  const frameBits = buildFrameBits(text);
-  const samples = bitsToSignal(frameBits, sampleRate, sps);
+  const frameBits = buildFrameBits(text, useFEC);
+  const samples = bitsToSignal(frameBits, sampleRate, sps, carrierHz);
 
   const buffer = ctx.createBuffer(1, samples.length, sampleRate);
   buffer.copyToChannel(samples, 0);
@@ -92,10 +134,10 @@ async function playFrame(text) {
   src.connect(ctx.destination);
   src.start();
 
-  log(`Передача: ${text} (${frameBits.length} бит, ${samples.length} сэмплов)`);
+  log(`Передача: ${text} (${frameBits.length} бит, ${samples.length} сэмплов, fc=${carrierHz} Гц, ${symbolRate} бод, FEC=${useFEC ? 'on' : 'off'})`);
 }
 
-function buildFrameBits(text) {
+function buildFrameBits(text, withFEC) {
   const payload = Array.from(encoder.encode(text));
   if (payload.length > 255) {
     throw new Error('Сообщение слишком длинное (макс 255 байт)');
@@ -106,16 +148,20 @@ function buildFrameBits(text) {
   const crc = crc16(dataBytes);
   const crcBytes = [(crc >> 8) & 0xff, crc & 0xff];
 
-  const bits = [];
-  bits.push(...buildPreambleBits());
-  bits.push(...wordToBits(SYNC_WORD, 32));
   const infoBits = [
     ...bytesToBits(header),
     ...bytesToBits(payload),
     ...bytesToBits(crcBytes),
   ];
-  const fecBits = convEncode(infoBits);
-  bits.push(...fecBits);
+  const bits = [];
+  bits.push(...buildPreambleBits());
+  bits.push(...wordToBits(SYNC_WORD, 32));
+  if (withFEC) {
+    const fecBits = convEncode(infoBits);
+    bits.push(...fecBits);
+  } else {
+    bits.push(...infoBits);
+  }
   return bits;
 }
 
@@ -127,10 +173,10 @@ function buildPreambleBits() {
   return arr;
 }
 
-function bitsToSignal(bits, sampleRate, sps) {
+function bitsToSignal(bits, sampleRate, sps, fc) {
   const totalSamples = bits.length * sps;
   const out = new Float32Array(totalSamples);
-  const w = 2 * Math.PI * CARRIER / sampleRate;
+  const w = 2 * Math.PI * fc / sampleRate;
   let sampleIndex = 0;
   const edge = Math.max(1, Math.floor(sps * 0.15));
 
@@ -154,12 +200,14 @@ function bitsToSignal(bits, sampleRate, sps) {
 
 async function startListening() {
   try {
+    applySettingsFromUI();
     const ctx = await ensureContext();
     stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
     await ctx.audioWorklet.addModule('demod-worklet.js');
 
     demodNode = new AudioWorkletNode(ctx, 'bpsk-demod', { numberOfOutputs: 0 });
     demodNode.port.onmessage = handleDemodMessage;
+    demodNode.port.postMessage({ type: 'config', carrierHz, symbolRate });
 
     const src = ctx.createMediaStreamSource(stream);
     src.connect(demodNode);
@@ -170,7 +218,7 @@ async function startListening() {
     listenBtn.classList.add('active');
     modePill.textContent = 'Режим: listen';
     statusPill.textContent = 'слушаем...';
-  log('Слушаем микрофон, ищем преамбулу');
+    log(`Слушаем микрофон, fc=${carrierHz} Гц, ${symbolRate} бод, FEC=${useFEC ? 'on' : 'off'}`);
   } catch (err) {
     console.error(err);
     log(`Ошибка доступа к микрофону: ${err.message}`);
@@ -208,6 +256,14 @@ function handleDemodMessage(event) {
 
 function handleBits(bits) {
   if (!bits || !bits.length) return;
+  if (useFEC) {
+    handleBitsFec(bits);
+  } else {
+    handleBitsPlain(bits);
+  }
+}
+
+function handleBitsFec(bits) {
   bitBuffer.push(...bits);
 
   if (!synced) {
@@ -227,6 +283,23 @@ function handleBits(bits) {
 
   codedBuffer.push(...bits);
   tryDecodeFrame();
+}
+
+function handleBitsPlain(bits) {
+  bitBuffer.push(...bits);
+  if (!synced) {
+    const idx = findSync(bitBuffer, syncBits);
+    if (idx !== -1) {
+      bitBuffer = bitBuffer.slice(idx + syncBits.length);
+      synced = true;
+      statusPill.textContent = 'sync найден';
+      log('Синхрослово найдено, декод без FEC...');
+    } else if (bitBuffer.length > 4096) {
+      bitBuffer = bitBuffer.slice(-2048);
+    }
+    return;
+  }
+  tryDecodePlain();
 }
 
 function resetAfterFrame() {
@@ -378,6 +451,38 @@ function viterbiDecode(codedBits) {
     bestState = prev;
   }
   return bits;
+}
+
+function tryDecodePlain() {
+  if (!synced) return;
+  if (bitBuffer.length < 16) return;
+  const len = bitsToByte(bitBuffer.slice(0, 8));
+  const flags = bitsToByte(bitBuffer.slice(8, 16));
+  if (len > 255) {
+    log(`Неверная длина (${len}), сбрасываем`);
+    resetAfterFrame();
+    return;
+  }
+  const need = 16 + len * 8 + 16;
+  if (bitBuffer.length < need) return;
+
+  const payloadBits = bitBuffer.slice(16, 16 + len * 8);
+  const crcBits = bitBuffer.slice(16 + len * 8, need);
+  const dataBytes = bitsToBytes(bitBuffer.slice(0, 16 + len * 8));
+  const recvCrc = bitsToWord(crcBits);
+  const calc = crc16(dataBytes);
+
+  if (recvCrc === calc) {
+    const payloadBytes = bitsToBytes(payloadBits);
+    const text = safeDecode(payloadBytes);
+    addRx(text);
+    statusPill.textContent = 'кадр принят';
+    log(`Кадр принят: ${text} (len=${len}, flags=${flags})`);
+  } else {
+    statusPill.textContent = 'CRC ошибка';
+    log(`CRC ошибка (ожидалось ${calc.toString(16)}, пришло ${recvCrc.toString(16)})`);
+  }
+  resetAfterFrame();
 }
 
 function tryDecodeFrame() {
