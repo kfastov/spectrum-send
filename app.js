@@ -1,7 +1,7 @@
 // Simple 18 kHz BPSK modem demo (send + listen) without external deps.
 const DEFAULT_CARRIER = 18_000;
 const DEFAULT_SYMBOL_RATE = 500; // baud
-const DEFAULT_PREAMBLE_MS = 200; // short by default
+const PREAMBLE_BITS_CONST = 80;
 const DEFAULT_LOCK = 0.45;
 const DEFAULT_HOLDOFF = 8;
 const MIN_CARRIER = 15_000;
@@ -42,8 +42,7 @@ let synced = false;
 let stream;
 let carrierHz = DEFAULT_CARRIER;
 let symbolRate = DEFAULT_SYMBOL_RATE;
-let preambleMs = DEFAULT_PREAMBLE_MS;
-let preambleBits = Math.round(DEFAULT_SYMBOL_RATE * (DEFAULT_PREAMBLE_MS / 1000));
+let preambleBits = PREAMBLE_BITS_CONST;
 let lockThreshold = DEFAULT_LOCK;
 let holdoffSymbols = DEFAULT_HOLDOFF;
 let txTimer = null;
@@ -93,9 +92,8 @@ function applySettingsFromUI() {
   freqInput.value = carrierHz;
   symbolRate = clamp(parseInt(baudInput.value, 10) || DEFAULT_SYMBOL_RATE, MIN_BAUD, MAX_BAUD);
   baudInput.value = symbolRate;
-  preambleMs = clamp(parseInt(preambleInput.value, 10) || DEFAULT_PREAMBLE_MS, MIN_PREAMBLE_MS, MAX_PREAMBLE_MS);
-  preambleInput.value = preambleMs;
-  preambleBits = Math.max(16, Math.round(symbolRate * (preambleMs / 1000)));
+  preambleBits = PREAMBLE_BITS_CONST;
+  preambleInput.value = PREAMBLE_BITS_CONST;
   lockThreshold = clamp(parseFloat(lockInput.value) || DEFAULT_LOCK, MIN_LOCK, MAX_LOCK);
   lockInput.value = lockThreshold.toFixed(2);
   holdoffSymbols = clamp(parseInt(holdoffInput.value, 10) || DEFAULT_HOLDOFF, MIN_HOLDOFF, MAX_HOLDOFF);
