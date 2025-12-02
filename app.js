@@ -261,10 +261,13 @@ function handleDemodMessage(event) {
   const msg = event.data;
   if (!msg) return;
   if (msg.type === 'locked') {
-    statusPill.textContent = `поймали преамбулу (corr=${msg.score.toFixed(2)})`;
-    log(`Поймали преамбулу, corr=${msg.score.toFixed(2)}`);
+    const df = msg.dfHz ? `, df=${msg.dfHz.toFixed(1)} Гц` : '';
+    statusPill.textContent = `поймали преамбулу (corr=${msg.score.toFixed(2)}${df})`;
+    log(`Поймали преамбулу, corr=${msg.score.toFixed(2)}${df}`);
   } else if (msg.type === 'bits') {
     handleBits(msg.bits);
+  } else if (msg.type === 'pll' && typeof msg.dfHz === 'number') {
+    log(`PLL df=${msg.dfHz.toFixed(1)} Гц`);
   }
 }
 

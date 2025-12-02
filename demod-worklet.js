@@ -9,6 +9,7 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
     this.lockThreshold = 0.3;
     this.lpfFactor = 2.0;
     this.preambleSymbols = 80;
+    this.holdoffSymbols = 40; // symbols to skip after lock so PLL stabilizes
 
     this.spsFloat = sampleRate / this.symbolRate;
     this.sps = Math.max(1, Math.round(this.spsFloat));
@@ -31,6 +32,8 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
 
     this.signBuf = [];
     this.lockedFlag = false;
+    this.holdoff = 0;
+    this.pllReport = 0;
     this.altSeq = new Array(this.preambleSymbols)
       .fill(0)
       .map((_, i) => (i % 2 === 0 ? 1 : -1));
@@ -75,6 +78,8 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
     this.outBits.length = 0;
     this.signBuf = [];
     this.lockedFlag = false;
+    this.holdoff = 0;
+    this.pllReport = 0;
   }
 
   applyConfig(cfg) {
@@ -89,6 +94,9 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
     }
     if (typeof cfg.lockThreshold === 'number') {
       this.lockThreshold = cfg.lockThreshold;
+    }
+    if (typeof cfg.holdoffSymbols === 'number' && cfg.holdoffSymbols >= 0) {
+      this.holdoffSymbols = Math.floor(cfg.holdoffSymbols);
     }
     this.spsFloat = sampleRate / this.symbolRate;
     this.sps = Math.max(1, Math.round(this.spsFloat));
@@ -176,7 +184,6 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
 
   handleSymbol(val) {
     const bit = val >= 0 ? 0 : 1;
-    this.outBits.push(bit);
 
     // Track preamble correlation for UI (no gating)
     const sign = bit === 0 ? 1 : -1;
@@ -192,11 +199,25 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
       corr /= this.preambleSymbols;
       if (corr > this.lockThreshold && !this.lockedFlag) {
         this.lockedFlag = true;
-        this.port.postMessage({ type: 'locked', score: corr });
+        this.holdoff = this.holdoffSymbols;
+        this.pllReport = 400; // symbols before next PLL report
+        this.port.postMessage({ type: 'locked', score: corr, dfHz: this.freqCorr * sampleRate / (2 * Math.PI) });
       } else if (corr < this.lockThreshold * 0.5) {
         this.lockedFlag = false;
       }
     }
+
+    if (this.lockedFlag && this.pllReport-- <= 0) {
+      this.pllReport = 400;
+      this.port.postMessage({ type: 'pll', dfHz: this.freqCorr * sampleRate / (2 * Math.PI) });
+    }
+
+    if (this.lockedFlag && this.holdoff > 0) {
+      this.holdoff--;
+      return;
+    }
+
+    this.outBits.push(bit);
   }
 }
 
