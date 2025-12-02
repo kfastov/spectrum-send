@@ -8,7 +8,7 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
     this.fc = 18_000;
     this.symbolRate = 500;
     this.preambleSymbols = 80;
-    this.lockThreshold = 0.7; // normalized corr for 1010... window
+    this.lockThreshold = 0.45; // normalized corr for 1010... window
     this.holdoffSymbols = 8;  // skip symbols after lock to let PLL settle
 
     this.resetState();
@@ -29,6 +29,8 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
     if (typeof cfg.carrierHz === 'number') this.fc = cfg.carrierHz;
     if (typeof cfg.symbolRate === 'number' && cfg.symbolRate > 0) this.symbolRate = cfg.symbolRate;
     if (typeof cfg.preambleSymbols === 'number' && cfg.preambleSymbols > 8) this.preambleSymbols = Math.floor(cfg.preambleSymbols);
+    if (typeof cfg.lockThreshold === 'number') this.lockThreshold = cfg.lockThreshold;
+    if (typeof cfg.holdoffSymbols === 'number' && cfg.holdoffSymbols >= 0) this.holdoffSymbols = Math.floor(cfg.holdoffSymbols);
     this.buildFilters();
     this.resetState();
   }

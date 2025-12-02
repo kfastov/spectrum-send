@@ -1,7 +1,19 @@
 // Simple 18 kHz BPSK modem demo (send + listen) without external deps.
-const CARRIER = 18_000;
-const SYMBOL_RATE = 500; // baud
-const PREAMBLE_BITS = 80;
+const DEFAULT_CARRIER = 18_000;
+const DEFAULT_SYMBOL_RATE = 500; // baud
+const DEFAULT_PREAMBLE_MS = 200; // short by default
+const DEFAULT_LOCK = 0.45;
+const DEFAULT_HOLDOFF = 8;
+const MIN_CARRIER = 15_000;
+const MAX_CARRIER = 21_000;
+const MIN_BAUD = 100;
+const MAX_BAUD = 1500;
+const MIN_LOCK = 0.1;
+const MAX_LOCK = 0.95;
+const MIN_PREAMBLE_MS = 80;
+const MAX_PREAMBLE_MS = 1500;
+const MIN_HOLDOFF = 0;
+const MAX_HOLDOFF = 100;
 const SYNC_WORD = 0xa5a5a5a5 >>> 0;
 const VERSION = 1;
 
@@ -12,6 +24,11 @@ const modePill = document.getElementById('modePill');
 const statusPill = document.getElementById('statusPill');
 const rxArea = document.getElementById('rxArea');
 const logArea = document.getElementById('logArea');
+const freqInput = document.getElementById('freqInput');
+const baudInput = document.getElementById('baudInput');
+const preambleInput = document.getElementById('preambleInput');
+const lockInput = document.getElementById('lockInput');
+const holdoffInput = document.getElementById('holdoffInput');
 
 let audioCtx;
 let demodNode;
@@ -19,6 +36,12 @@ let listening = false;
 let bitBuffer = [];
 let synced = false;
 let stream;
+let carrierHz = DEFAULT_CARRIER;
+let symbolRate = DEFAULT_SYMBOL_RATE;
+let preambleMs = DEFAULT_PREAMBLE_MS;
+let preambleBits = Math.round(DEFAULT_SYMBOL_RATE * (DEFAULT_PREAMBLE_MS / 1000));
+let lockThreshold = DEFAULT_LOCK;
+let holdoffSymbols = DEFAULT_HOLDOFF;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -40,6 +63,14 @@ listenBtn.addEventListener('click', () => {
   listening ? stopListening() : startListening();
 });
 
+freqInput.addEventListener('change', applySettingsFromUI);
+baudInput.addEventListener('change', applySettingsFromUI);
+preambleInput.addEventListener('change', applySettingsFromUI);
+lockInput.addEventListener('change', applySettingsFromUI);
+holdoffInput.addEventListener('change', applySettingsFromUI);
+
+applySettingsFromUI();
+
 function log(msg) {
   const line = document.createElement('div');
   line.textContent = `[${new Date().toLocaleTimeString()}] ${msg}`;
@@ -47,6 +78,39 @@ function log(msg) {
   logArea.scrollTop = logArea.scrollHeight;
 }
 
+function clamp(v, lo, hi) {
+  return Math.min(Math.max(v, lo), hi);
+}
+
+function applySettingsFromUI() {
+  carrierHz = clamp(parseInt(freqInput.value, 10) || DEFAULT_CARRIER, MIN_CARRIER, MAX_CARRIER);
+  freqInput.value = carrierHz;
+  symbolRate = clamp(parseInt(baudInput.value, 10) || DEFAULT_SYMBOL_RATE, MIN_BAUD, MAX_BAUD);
+  baudInput.value = symbolRate;
+  preambleMs = clamp(parseInt(preambleInput.value, 10) || DEFAULT_PREAMBLE_MS, MIN_PREAMBLE_MS, MAX_PREAMBLE_MS);
+  preambleInput.value = preambleMs;
+  preambleBits = Math.max(16, Math.round(symbolRate * (preambleMs / 1000)));
+  lockThreshold = clamp(parseFloat(lockInput.value) || DEFAULT_LOCK, MIN_LOCK, MAX_LOCK);
+  lockInput.value = lockThreshold.toFixed(2);
+  holdoffSymbols = clamp(parseInt(holdoffInput.value, 10) || DEFAULT_HOLDOFF, MIN_HOLDOFF, MAX_HOLDOFF);
+  holdoffInput.value = holdoffSymbols;
+
+  modePill.textContent = `Режим: ${listening ? 'listen' : 'idle'}`;
+  document.getElementById('carrierPill')?.textContent = `fc: ${(carrierHz / 1000).toFixed(1)} кГц`;
+  document.getElementById('ratePill')?.textContent = `${symbolRate} бод`;
+  document.getElementById('statusPill')?.textContent = listening ? 'слушаем...' : 'ожидание';
+
+  if (demodNode) {
+    demodNode.port.postMessage({
+      type: 'config',
+      carrierHz,
+      symbolRate,
+      preambleSymbols: preambleBits,
+      lockThreshold,
+      holdoffSymbols,
+    });
+  }
+}
 function addRx(text) {
   const line = document.createElement('div');
   line.className = 'rx-line';
@@ -74,10 +138,10 @@ async function ensureContext() {
 async function playFrame(text) {
   const ctx = await ensureContext();
   const sampleRate = ctx.sampleRate;
-  const sps = Math.round(sampleRate / SYMBOL_RATE);
+  const sps = Math.max(1, Math.round(sampleRate / symbolRate));
 
   const frameBits = buildFrameBits(text);
-  const samples = bitsToSignal(frameBits, sampleRate, sps);
+  const samples = bitsToSignal(frameBits, sampleRate, sps, carrierHz);
 
   const buffer = ctx.createBuffer(1, samples.length, sampleRate);
   buffer.copyToChannel(samples, 0);
@@ -86,7 +150,7 @@ async function playFrame(text) {
   src.connect(ctx.destination);
   src.start();
 
-  log(`Передача: ${text} (${frameBits.length} бит, ${samples.length} сэмплов)`);
+  log(`Передача: ${text} (${frameBits.length} бит, ${samples.length} сэмплов, fc=${carrierHz} Гц, ${symbolRate} бод)`);
 }
 
 function buildFrameBits(text) {
@@ -101,7 +165,7 @@ function buildFrameBits(text) {
   const crcBytes = [(crc >> 8) & 0xff, crc & 0xff];
 
   const bits = [];
-  bits.push(...buildPreambleBits());
+  bits.push(...buildPreambleBits(preambleBits));
   bits.push(...wordToBits(SYNC_WORD, 32));
   bits.push(...bytesToBits(header));
   bits.push(...bytesToBits(payload));
@@ -109,18 +173,18 @@ function buildFrameBits(text) {
   return bits;
 }
 
-function buildPreambleBits() {
+function buildPreambleBits(len) {
   const arr = [];
-  for (let i = 0; i < PREAMBLE_BITS; i++) {
+  for (let i = 0; i < len; i++) {
     arr.push(i % 2 === 0 ? 1 : 0);
   }
   return arr;
 }
 
-function bitsToSignal(bits, sampleRate, sps) {
+function bitsToSignal(bits, sampleRate, sps, fc) {
   const totalSamples = bits.length * sps;
   const out = new Float32Array(totalSamples);
-  const w = 2 * Math.PI * CARRIER / sampleRate;
+  const w = 2 * Math.PI * fc / sampleRate;
   let sampleIndex = 0;
   const edge = Math.max(1, Math.floor(sps * 0.15));
 
@@ -144,13 +208,21 @@ function bitsToSignal(bits, sampleRate, sps) {
 
 async function startListening() {
   try {
+    applySettingsFromUI();
     const ctx = await ensureContext();
     stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false } });
     await ctx.audioWorklet.addModule('demod-worklet.js');
 
     demodNode = new AudioWorkletNode(ctx, 'bpsk-demod', { numberOfOutputs: 0 });
     demodNode.port.onmessage = handleDemodMessage;
-    demodNode.port.postMessage({ type: 'config', carrierHz: CARRIER, symbolRate: SYMBOL_RATE, preambleSymbols: PREAMBLE_BITS });
+    demodNode.port.postMessage({
+      type: 'config',
+      carrierHz: carrierHz,
+      symbolRate: symbolRate,
+      preambleSymbols: preambleBits,
+      lockThreshold,
+      holdoffSymbols,
+    });
 
     const src = ctx.createMediaStreamSource(stream);
     src.connect(demodNode);
@@ -161,7 +233,7 @@ async function startListening() {
     listenBtn.classList.add('active');
     modePill.textContent = 'Режим: listen';
     statusPill.textContent = 'слушаем...';
-    log('Слушаем микрофон, ищем преамбулу');
+    log(`Слушаем микрофон: fc=${carrierHz} Гц, ${symbolRate} бод, преамбула ${preambleMs} мс, lock>${lockThreshold}, holdoff=${holdoffSymbols}`);
   } catch (err) {
     console.error(err);
     log(`Ошибка доступа к микрофону: ${err.message}`);

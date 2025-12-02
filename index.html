@@ -38,6 +38,17 @@
       align-items: stretch;
       margin-bottom: 18px;
     }
+    .controls.secondary {
+      margin-top: -6px;
+      flex-wrap: wrap;
+    }
+    .field {
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+      font-size: 13px;
+      color: #9fb4cc;
+    }
     input[type="text"] {
       flex: 1;
       padding: 12px;
@@ -48,7 +59,21 @@
       color: #e6edf3;
       outline: none;
     }
+    input[type="number"] {
+      padding: 10px;
+      font-size: 14px;
+      border-radius: 8px;
+      border: 1px solid #232a36;
+      background: #0b0c11;
+      color: #e6edf3;
+      outline: none;
+      width: 130px;
+    }
     input[type="text"]:focus {
+      border-color: #48b9ff;
+      box-shadow: 0 0 0 1px #48b9ff22;
+    }
+    input[type="number"]:focus {
       border-color: #48b9ff;
       box-shadow: 0 0 0 1px #48b9ff22;
     }
@@ -147,6 +172,28 @@
     <input id="textInput" type="text" autocomplete="off" placeholder="Текст для передачи...">
     <button id="sendBtn">Play</button>
     <button id="listenBtn">Listen</button>
+  </div>
+  <div class="controls secondary">
+    <label class="field">
+      <span>fc, Гц</span>
+      <input id="freqInput" type="number" min="15000" max="21000" step="100" value="18000">
+    </label>
+    <label class="field">
+      <span>baud</span>
+      <input id="baudInput" type="number" min="100" max="1500" step="50" value="500">
+    </label>
+    <label class="field">
+      <span>Преамбула, мс</span>
+      <input id="preambleInput" type="number" min="80" max="1500" step="20" value="200">
+    </label>
+    <label class="field">
+      <span>Lock threshold</span>
+      <input id="lockInput" type="number" min="0.1" max="0.95" step="0.05" value="0.45">
+    </label>
+    <label class="field">
+      <span>Holdoff, sym</span>
+      <input id="holdoffInput" type="number" min="0" max="100" step="1" value="8">
+    </label>
   </div>
   <div class="status">
     <div class="pill" id="modePill">Режим: idle</div>
