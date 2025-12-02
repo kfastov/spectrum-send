@@ -5,6 +5,10 @@ const MIN_CARRIER = 15_000;
 const MAX_CARRIER = 21_000;
 const MIN_BAUD = 100;
 const MAX_BAUD = 1_500;
+const MIN_LPF_FACTOR = 1;
+const MAX_LPF_FACTOR = 6;
+const MIN_CORR = 0.05;
+const MAX_CORR = 1;
 const PREAMBLE_BITS = 80;
 const SYNC_WORD = 0xa5a5a5a5 >>> 0;
 const VERSION = 1;
@@ -23,6 +27,8 @@ const logArea = document.getElementById('logArea');
 const freqInput = document.getElementById('freqInput');
 const baudInput = document.getElementById('baudInput');
 const fecCheckbox = document.getElementById('fecCheckbox');
+const lpfInput = document.getElementById('lpfInput');
+const corrInput = document.getElementById('corrInput');
 
 let audioCtx;
 let demodNode;
@@ -34,6 +40,8 @@ let stream;
 let carrierHz = DEFAULT_CARRIER;
 let symbolRate = DEFAULT_SYMBOL_RATE;
 let useFEC = true;
+let lpfFactor = 2.0;
+let lockThreshold = 0.3;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -59,6 +67,8 @@ listenBtn.addEventListener('click', () => {
 freqInput.addEventListener('change', applySettingsFromUI);
 baudInput.addEventListener('change', applySettingsFromUI);
 fecCheckbox.addEventListener('change', applySettingsFromUI);
+lpfInput.addEventListener('change', applySettingsFromUI);
+corrInput.addEventListener('change', applySettingsFromUI);
 
 applySettingsFromUI();
 
@@ -79,9 +89,13 @@ function applySettingsFromUI() {
   symbolRate = clamp(parseInt(baudInput.value, 10) || DEFAULT_SYMBOL_RATE, MIN_BAUD, MAX_BAUD);
   baudInput.value = symbolRate;
   useFEC = !!fecCheckbox.checked;
+  lpfFactor = clamp(parseFloat(lpfInput.value) || 2, MIN_LPF_FACTOR, MAX_LPF_FACTOR);
+  lpfInput.value = lpfFactor.toFixed(1);
+  lockThreshold = clamp(parseFloat(corrInput.value) || 0.3, MIN_CORR, MAX_CORR);
+  corrInput.value = lockThreshold.toFixed(2);
   updatePills();
   if (demodNode) {
-    demodNode.port.postMessage({ type: 'config', carrierHz, symbolRate });
+    demodNode.port.postMessage({ type: 'config', carrierHz, symbolRate, lpfFactor, lockThreshold });
     bitBuffer = [];
     codedBuffer = [];
     synced = false;
@@ -134,7 +148,7 @@ async function playFrame(text) {
   src.connect(ctx.destination);
   src.start();
 
-  log(`Передача: ${text} (${frameBits.length} бит, ${samples.length} сэмплов, fc=${carrierHz} Гц, ${symbolRate} бод, FEC=${useFEC ? 'on' : 'off'})`);
+  log(`Передача: ${text} (${frameBits.length} бит, ${samples.length} сэмплов, fc=${carrierHz} Гц, ${symbolRate} бод, FEC=${useFEC ? 'on' : 'off'}, LPF≈${(symbolRate * lpfFactor).toFixed(0)} Гц)`);
 }
 
 function buildFrameBits(text, withFEC) {
@@ -207,7 +221,7 @@ async function startListening() {
 
     demodNode = new AudioWorkletNode(ctx, 'bpsk-demod', { numberOfOutputs: 0 });
     demodNode.port.onmessage = handleDemodMessage;
-    demodNode.port.postMessage({ type: 'config', carrierHz, symbolRate });
+    demodNode.port.postMessage({ type: 'config', carrierHz, symbolRate, lpfFactor, lockThreshold });
 
     const src = ctx.createMediaStreamSource(stream);
     src.connect(demodNode);

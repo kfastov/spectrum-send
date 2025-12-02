@@ -11,7 +11,11 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
     this.phase = 0;
     this.phaseInc = (2 * Math.PI * this.fc) / sampleRate;
     this.lpState = 0;
-    this.lpAlpha = this.calcAlpha(1000); // low-pass cutoff ~1 kHz
+    this.lpAlpha = this.calcAlpha(1000); // updated by config
+    this.env = 1e-3;
+    this.agcAlpha = this.calcAlpha(20); // slow envelope tracker
+    this.lockThreshold = 0.3;
+    this.lpfFactor = 2.0;
     this.buffer = [];
     this.cursor = 0;
     this.locked = false;
@@ -35,6 +39,7 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
     this.locked = false;
     this.phase = 0;
     this.lpState = 0;
+    this.env = 1e-3;
   }
 
   applyConfig(cfg) {
@@ -44,8 +49,16 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
     if (typeof cfg.symbolRate === 'number' && cfg.symbolRate > 0) {
       this.symbolRate = cfg.symbolRate;
     }
+    if (typeof cfg.lpfFactor === 'number' && cfg.lpfFactor > 0) {
+      this.lpfFactor = cfg.lpfFactor;
+    }
+    if (typeof cfg.lockThreshold === 'number') {
+      this.lockThreshold = cfg.lockThreshold;
+    }
     this.sps = Math.max(1, Math.round(sampleRate / this.symbolRate));
     this.phaseInc = (2 * Math.PI * this.fc) / sampleRate;
+    const cutoff = Math.max(150, this.symbolRate * this.lpfFactor);
+    this.lpAlpha = this.calcAlpha(cutoff);
     this.altSeq = new Array(this.preambleSymbols)
       .fill(0)
       .map((_, i) => (i % 2 === 0 ? 1 : -1));
@@ -63,7 +76,10 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
     if (this.phase > Math.PI * 2) this.phase -= Math.PI * 2;
     const mixed = sample * Math.cos(this.phase);
     this.lpState += this.lpAlpha * (mixed - this.lpState);
-    return this.lpState;
+    const envTarget = Math.abs(this.lpState);
+    this.env += this.agcAlpha * (envTarget - this.env);
+    const norm = this.lpState / Math.max(1e-4, this.env);
+    return norm;
   }
 
   process(inputs) {
@@ -118,7 +134,7 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
       }
     }
 
-    if (bestScore > 0.5) {
+    if (bestScore > this.lockThreshold) {
       this.locked = true;
       this.cursor = bestOffset + this.preambleSymbols * this.sps;
       this.port.postMessage({ type: 'locked', score: bestScore });
