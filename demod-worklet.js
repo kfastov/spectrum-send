@@ -8,7 +8,7 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
     this.fc = 18_000;
     this.symbolRate = 500;
     this.preambleSymbols = 80;
-    this.lockThreshold = 0.45; // normalized corr for 1010... window
+    this.lockThreshold = 0.35; // normalized corr for 1010... window
     this.holdoffSymbols = 8;  // skip symbols after lock to let PLL settle
 
     this.resetState();
@@ -82,6 +82,7 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
     this.mfPos = 0;
     this.processedSamples = 0;
     this.delayReport = 0;
+    this.startTime = currentTime;
   }
 
   calcAlpha(cutoff) {
@@ -159,7 +160,8 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
     if (this.delayReport-- <= 0) {
       this.delayReport = 1024;
       const procTime = this.processedSamples / sampleRate;
-      const delay = currentTime - procTime;
+      const elapsed = currentTime - this.startTime;
+      const delay = elapsed - procTime;
       this.port.postMessage({ type: 'delay', sec: delay });
     }
     return true;
