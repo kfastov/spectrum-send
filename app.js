@@ -96,9 +96,12 @@ function applySettingsFromUI() {
   holdoffInput.value = holdoffSymbols;
 
   modePill.textContent = `Режим: ${listening ? 'listen' : 'idle'}`;
-  document.getElementById('carrierPill')?.textContent = `fc: ${(carrierHz / 1000).toFixed(1)} кГц`;
-  document.getElementById('ratePill')?.textContent = `${symbolRate} бод`;
-  document.getElementById('statusPill')?.textContent = listening ? 'слушаем...' : 'ожидание';
+  const carrierPill = document.getElementById('carrierPill');
+  const ratePill = document.getElementById('ratePill');
+  const statusPillEl = document.getElementById('statusPill');
+  if (carrierPill) carrierPill.textContent = `fc: ${(carrierHz / 1000).toFixed(1)} кГц`;
+  if (ratePill) ratePill.textContent = `${symbolRate} бод`;
+  if (statusPillEl) statusPillEl.textContent = listening ? 'слушаем...' : 'ожидание';
 
   if (demodNode) {
     demodNode.port.postMessage({
