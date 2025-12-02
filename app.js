@@ -29,6 +29,10 @@ const baudInput = document.getElementById('baudInput');
 const preambleInput = document.getElementById('preambleInput');
 const lockInput = document.getElementById('lockInput');
 const holdoffInput = document.getElementById('holdoffInput');
+const txBar = document.getElementById('txBar');
+const txText = document.getElementById('txText');
+const rxBar = document.getElementById('rxBar');
+const rxText = document.getElementById('rxText');
 
 let audioCtx;
 let demodNode;
@@ -42,6 +46,8 @@ let preambleMs = DEFAULT_PREAMBLE_MS;
 let preambleBits = Math.round(DEFAULT_SYMBOL_RATE * (DEFAULT_PREAMBLE_MS / 1000));
 let lockThreshold = DEFAULT_LOCK;
 let holdoffSymbols = DEFAULT_HOLDOFF;
+let txTimer = null;
+let txEndTime = 0;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -153,7 +159,9 @@ async function playFrame(text) {
   src.connect(ctx.destination);
   src.start();
 
-  log(`Передача: ${text} (${frameBits.length} бит, ${samples.length} сэмплов, fc=${carrierHz} Гц, ${symbolRate} бод)`);
+  const duration = samples.length / sampleRate;
+  startTxProgress(duration);
+  log(`Передача: ${text} (${frameBits.length} бит, ${samples.length} сэмплов, fc=${carrierHz} Гц, ${symbolRate} бод, ${duration.toFixed(2)} с)`);
 }
 
 function buildFrameBits(text) {
@@ -271,6 +279,8 @@ function handleDemodMessage(event) {
     handleBits(msg.bits);
   } else if (msg.type === 'pll' && typeof msg.dfHz === 'number') {
     log(`PLL df=${msg.dfHz.toFixed(2)} Гц`);
+  } else if (msg.type === 'delay' && typeof msg.sec === 'number') {
+    updateRxDelay(msg.sec);
   }
 }
 
@@ -410,4 +420,34 @@ function safeDecode(arr) {
   } catch (_) {
     return arr.map(v => v.toString(16).padStart(2, '0')).join(' ');
   }
+}
+
+function startTxProgress(durationSec) {
+  if (!txBar || !txText) return;
+  if (txTimer) clearInterval(txTimer);
+  const start = performance.now();
+  txEndTime = start + durationSec * 1000;
+  const tick = () => {
+    const now = performance.now();
+    const elapsed = (now - start) / 1000;
+    const remain = Math.max(0, (txEndTime - now) / 1000);
+    const frac = Math.min(1, elapsed / durationSec);
+    txBar.style.width = `${(frac * 100).toFixed(1)}%`;
+    txText.textContent = `${elapsed.toFixed(1)} / ${durationSec.toFixed(1)} c`;
+    if (now >= txEndTime) {
+      txBar.style.width = '0%';
+      txText.textContent = `0.0 / 0.0 c`;
+      txTimer = null;
+    }
+  };
+  tick();
+  txTimer = setInterval(tick, 50);
+}
+
+function updateRxDelay(sec) {
+  if (!rxBar || !rxText) return;
+  const clamped = Math.max(0, sec);
+  const frac = Math.min(1, clamped / 1.0); // assume >1s is bad, clamp UI
+  rxBar.style.width = `${(frac * 100).toFixed(1)}%`;
+  rxText.textContent = `${clamped.toFixed(3)} c`;
 }

@@ -140,6 +140,46 @@
       color: #b9cbe5;
       letter-spacing: 0.3px;
     }
+    .progress-row {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+      gap: 12px;
+      margin: 14px 0 6px;
+    }
+    .prog {
+      background: #0b0d12;
+      border: 1px solid #1c212d;
+      border-radius: 10px;
+      padding: 10px 12px;
+    }
+    .prog-label {
+      font-size: 13px;
+      color: #9fb4cc;
+      margin-bottom: 6px;
+    }
+    .prog-bar {
+      position: relative;
+      width: 100%;
+      height: 10px;
+      background: #141824;
+      border-radius: 6px;
+      overflow: hidden;
+      border: 1px solid #1f2534;
+    }
+    .prog-bar .fill {
+      position: absolute;
+      left: 0;
+      top: 0;
+      bottom: 0;
+      width: 0%;
+      background: linear-gradient(135deg, #1fc8ff, #0d73ff);
+      transition: width 0.05s linear;
+    }
+    .prog-text {
+      margin-top: 6px;
+      font-size: 13px;
+      color: #d7e3f5;
+    }
     #rxArea, #logArea {
       min-height: 80px;
       max-height: 220px;
@@ -200,6 +240,18 @@
     <div class="pill" id="carrierPill">fc: 18 кГц</div>
     <div class="pill" id="ratePill">500 бод</div>
     <div class="pill" id="statusPill">ожидание</div>
+  </div>
+  <div class="progress-row">
+    <div class="prog">
+      <div class="prog-label">TX</div>
+      <div class="prog-bar"><div id="txBar" class="fill" style="width:0%"></div></div>
+      <div class="prog-text" id="txText">0.0 / 0.0 c</div>
+    </div>
+    <div class="prog">
+      <div class="prog-label">RX delay</div>
+      <div class="prog-bar"><div id="rxBar" class="fill" style="width:0%"></div></div>
+      <div class="prog-text" id="rxText">0.0 c</div>
+    </div>
   </div>
 
   <div class="panel">

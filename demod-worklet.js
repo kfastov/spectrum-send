@@ -80,6 +80,8 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
     this.holdoff = 0;
     this.preambleCorr = 0;
     this.mfPos = 0;
+    this.processedSamples = 0;
+    this.delayReport = 0;
   }
 
   calcAlpha(cutoff) {
@@ -147,11 +149,18 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
         this.handleSymbol(sym);
         this.prevSym = sym;
       }
+      this.processedSamples += 1;
     }
 
     if (this.outBits.length) {
       this.port.postMessage({ type: 'bits', bits: this.outBits });
       this.outBits = [];
+    }
+    if (this.delayReport-- <= 0) {
+      this.delayReport = 1024;
+      const procTime = this.processedSamples / sampleRate;
+      const delay = currentTime - procTime;
+      this.port.postMessage({ type: 'delay', sec: delay });
     }
     return true;
   }
