@@ -150,6 +150,7 @@ async function startListening() {
 
     demodNode = new AudioWorkletNode(ctx, 'bpsk-demod', { numberOfOutputs: 0 });
     demodNode.port.onmessage = handleDemodMessage;
+    demodNode.port.postMessage({ type: 'config', carrierHz: CARRIER, symbolRate: SYMBOL_RATE, preambleSymbols: PREAMBLE_BITS });
 
     const src = ctx.createMediaStreamSource(stream);
     src.connect(demodNode);
@@ -193,6 +194,8 @@ function handleDemodMessage(event) {
     log(`Поймали преамбулу, corr=${msg.score.toFixed(2)}`);
   } else if (msg.type === 'bits') {
     handleBits(msg.bits);
+  } else if (msg.type === 'pll' && typeof msg.dfHz === 'number') {
+    log(`PLL df=${msg.dfHz.toFixed(2)} Гц`);
   }
 }
 

@@ -1,37 +1,83 @@
-// AudioWorkletProcessor for simple BPSK demodulation at 18 kHz.
-// Detects alternating preamble, locks symbol timing, then emits hard-decision bits.
+// AudioWorkletProcessor: BPSK demod with Costas PLL, matched filter, and simple Gardner timing loop.
+// Emits hard bits only after preamble correlation; sync/FEC parsing is done on the main thread.
 
 class BpskDemodProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
+    // Defaults match transmitter
     this.fc = 18_000;
     this.symbolRate = 500;
-    this.sps = Math.max(1, Math.round(sampleRate / this.symbolRate));
     this.preambleSymbols = 80;
-    this.phase = 0;
-    this.phaseInc = (2 * Math.PI * this.fc) / sampleRate;
-    this.lpState = 0;
-    this.lpAlpha = this.calcAlpha(1000); // low-pass cutoff ~1 kHz
-    this.buffer = [];
-    this.cursor = 0;
-    this.locked = false;
-    this.altSeq = new Array(this.preambleSymbols)
-      .fill(0)
-      .map((_, i) => (i % 2 === 0 ? 1 : -1));
+    this.lockThreshold = 0.7; // normalized corr for 1010... window
+    this.holdoffSymbols = 8;  // skip symbols after lock to let PLL settle
+
+    this.resetState();
+    this.buildFilters();
 
     this.port.onmessage = (ev) => {
-      if (ev.data && ev.data.type === 'reset') {
-        this.reset();
+      const data = ev.data;
+      if (!data) return;
+      if (data.type === 'reset') {
+        this.resetState();
+      } else if (data.type === 'config') {
+        this.applyConfig(data);
       }
     };
   }
 
-  reset() {
-    this.buffer = [];
-    this.cursor = 0;
-    this.locked = false;
+  applyConfig(cfg) {
+    if (typeof cfg.carrierHz === 'number') this.fc = cfg.carrierHz;
+    if (typeof cfg.symbolRate === 'number' && cfg.symbolRate > 0) this.symbolRate = cfg.symbolRate;
+    if (typeof cfg.preambleSymbols === 'number' && cfg.preambleSymbols > 8) this.preambleSymbols = Math.floor(cfg.preambleSymbols);
+    this.buildFilters();
+    this.resetState();
+  }
+
+  buildFilters() {
+    this.spsFloat = sampleRate / this.symbolRate;
+    this.spsNom = this.spsFloat;
+    this.omega = this.spsFloat;
+    this.ncoStep = (2 * Math.PI * this.fc) / sampleRate;
+
+    // Low-pass for I/Q after mixing. Cutoff ~ 2x symbol rate, min 300 Hz.
+    const cutoff = Math.max(300, this.symbolRate * 2.2);
+    this.lpfAlpha = this.calcAlpha(cutoff);
+
+    // Raised-cosine-ish matched filter (~6 symbols long).
+    const tapsLen = Math.max(16, Math.round(this.spsFloat * 6));
+    this.mfTaps = new Float32Array(tapsLen);
+    for (let i = 0; i < tapsLen; i++) {
+      this.mfTaps[i] = 0.5 - 0.5 * Math.cos((2 * Math.PI * i) / (tapsLen - 1));
+    }
+    let sum = 0;
+    for (let i = 0; i < tapsLen; i++) sum += this.mfTaps[i];
+    for (let i = 0; i < tapsLen; i++) this.mfTaps[i] /= sum || 1;
+
+    this.mfBuf = new Float32Array(tapsLen);
+    this.mfPos = 0;
+
+    this.altSeq = new Array(this.preambleSymbols).fill(0).map((_, i) => (i % 2 === 0 ? 1 : -1));
+  }
+
+  resetState() {
     this.phase = 0;
-    this.lpState = 0;
+    this.freqCorr = 0;
+    this.lpI = 0;
+    this.lpQ = 0;
+    this.env = 1e-3;
+    this.agcAlpha = this.calcAlpha(20); // slow envelope tracker
+    this.pllAlpha = 2e-4;
+    this.pllBeta = 5e-7;
+    this.clockAlpha = 1e-3;
+    this.clockBeta = 5e-4;
+    this.timeAcc = 0;
+    this.prevSym = 0;
+    this.outBits = [];
+    this.signBuf = [];
+    this.locked = false;
+    this.holdoff = 0;
+    this.preambleCorr = 0;
+    this.mfPos = 0;
   }
 
   calcAlpha(cutoff) {
@@ -40,96 +86,117 @@ class BpskDemodProcessor extends AudioWorkletProcessor {
     return dt / (rc + dt);
   }
 
-  mix(sample) {
-    this.phase += this.phaseInc;
-    if (this.phase > Math.PI * 2) this.phase -= Math.PI * 2;
-    const mixed = sample * Math.cos(this.phase);
-    this.lpState += this.lpAlpha * (mixed - this.lpState);
-    return this.lpState;
-  }
-
   process(inputs) {
     const input = inputs[0];
-    if (!input || input.length === 0) {
-      return true;
-    }
+    if (!input || input.length === 0) return true;
     const chan = input[0];
-    for (let i = 0; i < chan.length; i++) {
-      const bb = this.mix(chan[i]);
-      this.buffer.push(bb);
+    const tapsLen = this.mfTaps.length;
+
+    for (let n = 0; n < chan.length; n++) {
+      // 1) Mix to baseband with NCO + Costas PLL
+      this.phase += this.ncoStep + this.freqCorr;
+      if (this.phase > Math.PI * 2) this.phase -= Math.PI * 2;
+      else if (this.phase < 0) this.phase += Math.PI * 2;
+
+      const cos = Math.cos(this.phase);
+      const sin = Math.sin(this.phase);
+      const iRaw = chan[n] * cos;
+      const qRaw = chan[n] * -sin;
+
+      // 2) Low-pass I/Q
+      this.lpI += this.lpfAlpha * (iRaw - this.lpI);
+      this.lpQ += this.lpfAlpha * (qRaw - this.lpQ);
+
+      // 3) AGC
+      const mag = Math.hypot(this.lpI, this.lpQ);
+      this.env += this.agcAlpha * (mag - this.env);
+      const gain = 1 / Math.max(1e-4, this.env);
+      const iN = this.lpI * gain;
+      const qN = this.lpQ * gain;
+
+      // 4) PLL update (Costas)
+      const pllErr = iN * qN;
+      this.freqCorr += this.pllBeta * pllErr;
+      if (this.freqCorr > 0.1) this.freqCorr = 0.1;
+      else if (this.freqCorr < -0.1) this.freqCorr = -0.1;
+      this.phase += this.pllAlpha * pllErr;
+      if (this.phase > Math.PI * 2) this.phase -= Math.PI * 2;
+      else if (this.phase < 0) this.phase += Math.PI * 2;
+
+      // 5) Matched filter (FIR)
+      this.mfBuf[this.mfPos++] = iN;
+      if (this.mfPos >= tapsLen) this.mfPos = 0;
+      const y = this.applyMatchedFilter();
+
+      // 6) Timing recovery (Gardner-ish)
+      this.timeAcc += 1;
+      while (this.timeAcc >= this.omega) {
+        this.timeAcc -= this.omega;
+        const midIdx = (this.mfPos - Math.round(this.omega / 2) + tapsLen) % tapsLen;
+        const mid = this.mfBuf[midIdx];
+        const sym = y;
+        const terr = (sym - this.prevSym) * mid;
+        this.omega += this.clockBeta * terr;
+        const omegaMin = this.spsNom * 0.8;
+        const omegaMax = this.spsNom * 1.2;
+        if (this.omega < omegaMin) this.omega = omegaMin;
+        else if (this.omega > omegaMax) this.omega = omegaMax;
+        this.timeAcc += this.clockAlpha * terr;
+        this.handleSymbol(sym);
+        this.prevSym = sym;
+      }
     }
-    this.tryDemod();
-    this.trimBuffer();
+
+    if (this.outBits.length) {
+      this.port.postMessage({ type: 'bits', bits: this.outBits });
+      this.outBits = [];
+    }
     return true;
   }
 
-  tryDemod() {
-    if (!this.locked) {
-      this.detectPreamble();
+  applyMatchedFilter() {
+    let acc = 0;
+    let idx = this.mfPos - 1;
+    if (idx < 0) idx += this.mfTaps.length;
+    for (let k = 0; k < this.mfTaps.length; k++) {
+      const j = idx - k;
+      const jj = j < 0 ? j + this.mfTaps.length : j;
+      acc += this.mfBuf[jj] * this.mfTaps[k];
     }
-    if (this.locked) {
-      this.emitBits();
-    }
+    return acc;
   }
 
-  detectPreamble() {
-    const needSamples = this.preambleSymbols * this.sps;
-    if (this.buffer.length < needSamples) return;
+  handleSymbol(sym) {
+    const bit = sym >= 0 ? 0 : 1;
+    const sign = bit === 0 ? 1 : -1;
 
-    let bestScore = -1;
-    let bestOffset = 0;
-
-    for (let offset = 0; offset < this.sps; offset++) {
-      let score = 0;
-      let count = 0;
-      for (let sym = 0; sym < this.preambleSymbols; sym++) {
-        const start = offset + sym * this.sps;
-        if (start + this.sps > this.buffer.length) break;
-        let sum = 0;
-        for (let k = 0; k < this.sps; k++) {
-          sum += this.buffer[start + k];
-        }
-        const sgn = sum >= 0 ? 1 : -1;
-        score += sgn * this.altSeq[sym];
-        count++;
+    // Preamble correlation on symbol decisions
+    this.signBuf.push(sign);
+    if (this.signBuf.length > this.preambleSymbols) {
+      this.signBuf.shift();
+    }
+    if (!this.locked && this.signBuf.length === this.preambleSymbols) {
+      let corr = 0;
+      for (let i = 0; i < this.preambleSymbols; i++) {
+        corr += this.signBuf[i] * this.altSeq[i];
       }
-      const norm = score / (count || 1);
-      if (norm > bestScore) {
-        bestScore = norm;
-        bestOffset = offset;
+      corr /= this.preambleSymbols;
+      if (corr > this.lockThreshold) {
+        this.locked = true;
+        this.holdoff = this.holdoffSymbols;
+        this.outBits.length = 0; // drop preamble decisions
+        this.port.postMessage({ type: 'locked', score: corr });
+        return;
       }
     }
 
-    if (bestScore > 0.5) {
-      this.locked = true;
-      this.cursor = bestOffset + this.preambleSymbols * this.sps;
-      this.port.postMessage({ type: 'locked', score: bestScore });
+    if (!this.locked) return;
+    if (this.holdoff > 0) {
+      this.holdoff--;
+      return;
     }
-  }
 
-  emitBits() {
-    const out = [];
-    while (this.cursor + this.sps <= this.buffer.length) {
-      let sum = 0;
-      for (let i = 0; i < this.sps; i++) {
-        sum += this.buffer[this.cursor + i];
-      }
-      out.push(sum >= 0 ? 0 : 1);
-      this.cursor += this.sps;
-      if (out.length >= 4096) break;
-    }
-    if (out.length) {
-      this.port.postMessage({ type: 'bits', bits: out });
-    }
-  }
-
-  trimBuffer() {
-    const keep = this.sps * 500; // keep a few symbols worth of history
-    if (this.buffer.length > keep) {
-      const drop = this.buffer.length - keep;
-      this.buffer = this.buffer.slice(drop);
-      this.cursor = Math.max(0, this.cursor - drop);
-    }
+    this.outBits.push(bit);
   }
 }
 
