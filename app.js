@@ -249,7 +249,8 @@ async function startListening() {
     listenBtn.classList.add('active');
     modePill.textContent = 'Режим: listen';
     statusPill.textContent = 'слушаем...';
-    log(`Слушаем микрофон: fc=${carrierHz} Гц, ${symbolRate} бод, преамбула ${preambleMs} мс, lock>${lockThreshold}, holdoff=${holdoffSymbols}`);
+    const preambleMsView = Math.round((preambleBits / symbolRate) * 1000);
+    log(`Слушаем микрофон: fc=${carrierHz} Гц, ${symbolRate} бод, преамбула ${preambleMsView} мс, lock>${lockThreshold}, holdoff=${holdoffSymbols}`);
   } catch (err) {
     console.error(err);
     log(`Ошибка доступа к микрофону: ${err.message}`);
