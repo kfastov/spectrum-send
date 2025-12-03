@@ -47,6 +47,12 @@ let lockThreshold = DEFAULT_LOCK;
 let holdoffSymbols = DEFAULT_HOLDOFF;
 let txTimer = null;
 let txEndTime = 0;
+let frameStartMs = 0;
+let frameDeadlineMs = 0;
+const FRAME_TIMEOUT_MS = 500; // таймаут без данных после lock
+const MAX_FRAME_MS = 4000;
+const BASE_SYNC_MS = 800;
+const DEADLINE_MARGIN = 1.5;
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
@@ -149,6 +155,7 @@ async function playFrame(text) {
 
   const frameBits = buildFrameBits(text);
   const samples = bitsToSignal(frameBits, sampleRate, sps, carrierHz);
+  frameStartMs = performance.now();
 
   const buffer = ctx.createBuffer(1, samples.length, sampleRate);
   buffer.copyToChannel(samples, 0);
@@ -273,6 +280,8 @@ function handleDemodMessage(event) {
   if (msg.type === 'locked') {
     statusPill.textContent = `поймали преамбулу (corr=${msg.score.toFixed(2)})`;
     log(`Поймали преамбулу, corr=${msg.score.toFixed(2)}`);
+    frameStartMs = performance.now();
+    frameDeadlineMs = frameStartMs + BASE_SYNC_MS;
   } else if (msg.type === 'bits') {
     handleBits(msg.bits);
   } else if (msg.type === 'pll' && typeof msg.dfHz === 'number') {
@@ -285,12 +294,21 @@ function handleDemodMessage(event) {
 function handleBits(bits) {
   if (!bits || !bits.length) return;
   bitBuffer.push(...bits);
+  const now = performance.now();
+  if (frameDeadlineMs && now > frameDeadlineMs) {
+    log('Таймаут кадра, сброс sync');
+    resetAfterFrame();
+    bitBuffer = [];
+    return;
+  }
 
   if (!synced) {
     const idx = findSync(bitBuffer, syncBits);
     if (idx !== -1) {
       bitBuffer = bitBuffer.slice(idx + syncBits.length);
       synced = true;
+      // After sync, set deadline based on payload length once known; for now keep a short guard
+      frameDeadlineMs = now + FRAME_TIMEOUT_MS;
       statusPill.textContent = 'sync найден';
       log('Синхрослово найдено, читаем кадр...');
     } else if (bitBuffer.length > 4096) {
@@ -309,6 +327,13 @@ function handleBits(bits) {
   }
 
   const need = 16 + len * 8 + 16;
+  // Update deadline based on expected remaining bits
+  const bitsRemaining = need;
+  const estMs = Math.min(
+    MAX_FRAME_MS,
+    Math.max(100, bitsRemaining / symbolRate * 1000 * DEADLINE_MARGIN)
+  );
+  frameDeadlineMs = now + estMs;
   if (bitBuffer.length < need) return;
 
   const payloadBits = bitBuffer.slice(16, 16 + len * 8);
@@ -334,6 +359,8 @@ function handleBits(bits) {
 
 function resetAfterFrame() {
   synced = false;
+  frameStartMs = 0;
+  frameDeadlineMs = 0;
   if (demodNode) {
     demodNode.port.postMessage({ type: 'reset' });
   }
